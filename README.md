@@ -4,7 +4,7 @@
 
 [![License: MIT-0](https://img.shields.io/badge/License-MIT--0-blue.svg)](https://opensource.org/licenses/MIT-0)
 [![ClawHub](https://img.shields.io/badge/ClawHub-Published-orange)](https://clawhub.ai/alexbloch-ia/skills/always-on-agent-ops)
-[![Version](https://img.shields.io/badge/version-1.1.0-green)](https://clawhub.ai/alexbloch-ia/skills/always-on-agent-ops)
+[![Version](https://img.shields.io/badge/version-1.2.1-green)](https://clawhub.ai/alexbloch-ia/skills/always-on-agent-ops)
 
 A Claude Code / [OpenClaw](https://openclaw.ai) skill, published on [ClawHub](https://clawhub.ai/alexbloch-ia/skills/always-on-agent-ops). Portable operating doctrine — drop it into an agent's skills directory and follow it.
 
