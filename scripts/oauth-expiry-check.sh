@@ -78,7 +78,10 @@ def walk(o, path=""):
     elif o is not None:
         leaves += 1                          # scalar leaf: a profile actually carries data
 walk(d)
-clean = lambda p: p.replace('"', "").replace("\\", "")
+# Only key PATHS are ever printed - never a token value. Keys are data from the file:
+# whitelist their characters so a hostile key cannot break the JSON line or inject text.
+import re
+clean = lambda p: re.sub(r"[^A-Za-z0-9_.\[\]-]", "_", p)[:200]
 if good:
     # min, not max: a fresh profile must never mask an expired one, and a
     # long-lived refresh token must never mask a dead access token.

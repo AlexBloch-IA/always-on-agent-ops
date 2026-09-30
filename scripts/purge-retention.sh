@@ -6,9 +6,11 @@
 # Scope, deliberately narrow:
 #   deletes  -> regular *.log files under $OPENCLAW_HOME/logs older than N days
 #   reports  -> workspace size, so unbounded growth cannot happen silently
-#   never    -> rm -rf, never a directory, never anything outside $OPENCLAW_HOME/logs
-# PURGE_DRY_RUN=1 lists what would go without deleting. Default is APPLY: a purge
-# that must be armed by hand is a purge that never runs at 05:00 on a Sunday.
+#   never    -> a recursive delete, never a directory, never anything outside $OPENCLAW_HOME/logs
+# DEFAULT IS DRY RUN: it lists what would go and deletes nothing. Deletion happens ONLY
+# when PURGE_DRY_RUN is exactly "0" - set by a human after reading a dry-run list.
+# Unset, empty, "false", "no", anything else = dry run. A delete switch that fails open
+# on a typo is not a switch.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -70,10 +72,10 @@ if [ "${#stale[@]}" -eq 0 ]; then
   exit 0
 fi
 
-if [ "${PURGE_DRY_RUN:-0}" = "1" ]; then
+if [ "${PURGE_DRY_RUN-1}" != "0" ]; then
   printf '%s\n' "${stale[@]}" >&2
-  cron_message "cr-22-purge" "Nothing to do" "Dry run: ${#stale[@]} file(s) would be deleted." \
-    "retention" "Rerun without PURGE_DRY_RUN=1 to apply." "mode=dry_run days=$LOG_RETENTION_DAYS"
+  cron_message "cr-22-purge" "Human action required" "Dry run: ${#stale[@]} file(s) would be deleted, none were." \
+    "retention" "Review the list (stderr), then arm with PURGE_DRY_RUN=0." "mode=dry_run days=$LOG_RETENTION_DAYS"
   exit 0
 fi
 

@@ -9,6 +9,8 @@
 # Guards, in order:
 #   1. mkdir lock  -> two preflights firing the same event cannot double-run it.
 #      Released on RETURN, EXIT, INT and TERM, plus a TTL for locks orphaned by kill -9.
+#      The lock is an EMPTY directory, so it is removed with `rmdir`, never a recursive delete:
+#      rmdir refuses a symlink, a file, or a non-empty dir - it cannot delete anything else.
 #   2. job exists  -> an id that is not installed is an Error line, never a silent no-op.
 #   3. runningAtMs -> the job itself is already mid-run; do not stack a second turn.
 #
@@ -25,10 +27,12 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$DIR/cron-message.sh"
 
 LOCK_TTL_MIN="${LOCK_TTL_MIN:-15}"   # older than this = orphaned by a kill; reclaim it
+# Fed to `find -mmin`: junk there = a TTL that never fires (or always does). Fall back to 15.
+case "$LOCK_TTL_MIN" in ''|*[!0-9]*|0) LOCK_TTL_MIN=15 ;; esac
 LOCK_DIR=""
 
 release_lock() {
-  [ -n "${LOCK_DIR:-}" ] && rm -rf "$LOCK_DIR"
+  if [ -n "${LOCK_DIR:-}" ]; then rmdir "$LOCK_DIR" 2>/dev/null || true; fi
   LOCK_DIR=""
   return 0
 }
@@ -55,13 +59,14 @@ run_job() {
   # A lock older than the TTL survived a kill (daily restart, sleep, kill -9).
   # Without this, one killed run blocks the event forever while the channel
   # keeps reporting a healthy-looking "Blocked".
-  if [ -d "$lock_dir" ] && [ -n "$(find "$lock_dir" -maxdepth 0 -mmin +"$LOCK_TTL_MIN" 2>/dev/null)" ]; then
-    rm -rf "$lock_dir"
+  if [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] \
+     && [ -n "$(find "$lock_dir" -maxdepth 0 -type d -mmin +"$LOCK_TTL_MIN" 2>/dev/null)" ]; then
+    rmdir "$lock_dir" 2>/dev/null || true
   fi
 
   if ! mkdir "$lock_dir" 2>/dev/null; then
     cron_message "dispatch" "Blocked" "A dispatch is already in flight." "$id" \
-      "Wait for the current run; if it never clears: rm -rf $lock_dir" "$details"
+      "Wait for the current run; if it never clears: rmdir $lock_dir" "$details"
     return 0
   fi
   LOCK_DIR="$lock_dir"

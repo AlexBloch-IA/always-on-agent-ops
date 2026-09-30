@@ -1,6 +1,6 @@
 ---
 name: always-on-agent-ops
-description: Keep an OpenClaw agent running 24/7 — loopback gateway blocks inbound webhooks, OAuth expires silently, strict config. Use when crons stop firing. Trigger on "agent went quiet".
+description: OpenClaw 24/7 ops — creates crons, deletes old logs, authenticated HTTPS queue poll, event-to-cron dispatch with locks, reads auth-profiles.json expiry. For silent agents.
 metadata: {"clawdbot":{"emoji":"🛰️","requires":{"bins":["openclaw","node","curl","python3"]},"homepage":"https://openclaw.ai"}}
 ---
 
@@ -12,11 +12,13 @@ An always-on agent does not die loudly. It goes quiet — expired auth, an unloa
 
 | Item | What this skill needs |
 |---|---|
+| What the shipped scripts do | `preflight-queue.sh`: one **authenticated HTTPS GET** (Bearer) to a queue URL you configure. `event-dispatch.sh`: runs `openclaw cron get/run` on job ids from a closed, hardcoded list, with `mkdir` locks. `oauth-expiry-check.sh`: **reads `auth-profiles.json`** and prints only key paths and expiry epochs — never a token value. `purge-retention.sh`: **deletes `*.log` files** under `$OPENCLAW_HOME/logs` past 30 days — dry run until you arm it. `cron-message.sh`: prints a status line. |
+| What you create with it | Persistent OpenClaw **cron jobs** (§Cron layer), including a daily `gateway restart`. Every job is yours to review before `enabled: true`. |
 | Host access | A logged-in GUI desktop session, permanently. The daemon is not headless. |
-| Credentials | A gateway token (loopback only), a provider auth profile, and any queue Bearer you add. All in `~/.openclaw/` or the OS keychain — never in git, never in the agent workspace. |
+| Credentials | A gateway token (loopback only), a provider auth profile, and a queue Bearer. The Bearer lives in `~/.config/always-on-agent-ops/secrets.env` (chmod 600) — **outside** the skill directory, never in git, never in the agent workspace. Scope it read-only to the queue count, nothing else. |
 | Data persisted | Cron job definitions + run state (`~/.openclaw/cron/jobs.json`), the agent workspace and its memory files, logs. |
-| Retention — **executed, not declared** | Logs: **30 days**, deleted by `scripts/purge-retention.sh` (`cr-22`, weekly). Orphaned lock dirs: **15 min** TTL, reclaimed by the dispatcher. Cron run state: life of the job — it goes when you delete the job. Workspace/memory: **no automatic purge** — `cr-22` reports its size so growth cannot stay invisible; the number you keep is yours to set. |
-| Network out | Only what YOU configure: the queue you poll, the notification channel you name. Default is no network — with no `secrets.env`, the preflight emits `Human action required` and exits 0. |
+| Retention — **executed once armed** | Logs: **30 days**, deleted by `scripts/purge-retention.sh` (`cr-22`, weekly) — it ships in dry-run mode and deletes nothing until you set `PURGE_DRY_RUN=0` after reading one dry-run list. Orphaned lock dirs: **15 min** TTL, reclaimed by the dispatcher. Cron run state: life of the job — it goes when you delete the job. Workspace/memory: **no automatic purge** — `cr-22` reports its size so growth cannot stay invisible; the number you keep is yours to set. |
+| Network out | Only what YOU configure: the queue you poll (HTTPS only; plain `http://` is refused except to `localhost`/`127.0.0.1`/`[::1]`), the notification channel you name. Default is no network — with no config file, the preflight emits `Human action required` and exits 0. |
 | Network in | None. The gateway binds loopback. The optional loopback listener (below) is opt-in and never leaves the host. |
 | Notifications | `${NOTIFY_CHANNEL}` receives short status lines. They leave the machine. Never put secrets, PII, or payload dumps in them. |
 
@@ -29,17 +31,23 @@ Everything a cron reaches out to is a system you are responsible for: honour its
 # cron `kind: "command"` dies with exit 126 and NO status line — the silence this skill prevents.
 chmod +x scripts/preflight-queue.sh scripts/event-dispatch.sh \
          scripts/oauth-expiry-check.sh scripts/purge-retention.sh   # cron-message.sh is sourced: 644
-# The scripts read nothing from the network until this file exists.
-cat > scripts/secrets.env <<'EOF'
-QUEUE_URL=https://api.acme-corp.example/queue
+# Secrets live OUTSIDE the skill directory: a skill folder gets copied, synced, zipped and
+# re-published; a config dir does not. The preflight reads nothing from the network until this exists.
+install -d -m 700 ~/.config/always-on-agent-ops
+( umask 077; cat > ~/.config/always-on-agent-ops/secrets.env <<'EOF'
+QUEUE_URL=https://queue.example.com/v1/pending
 API_TOKEN=replace-me
 EOF
-chmod 600 scripts/secrets.env      # never commit it; it is not shipped with this skill
+)
+ls -l ~/.config/always-on-agent-ops/secrets.env   # expect -rw------- and your user
 ```
+
+The preflight **refuses** (one `Human action required` line, exit 0, no network) when the file is absent, empty, a symlink, not owned by you, has any group/other bit (`chmod 600` or `400` only), sits inside the skill directory, or when `QUEUE_URL` is not `https://` (loopback `http://` excepted) or carries `user@`. The file is **parsed for two keys, never sourced** — it cannot execute code. The Bearer goes to curl on stdin, never in argv, so it does not show in `ps`. Other path? `AOA_SECRETS_FILE=/abs/path` (absolute only). Prefer the OS keychain? Have a wrapper write the file at boot with `umask 077`; the checks are the same.
 
 | Variable | Where it lives | Who substitutes it |
 |---|---|---|
-| `QUEUE_URL`, `API_TOKEN` | `scripts/secrets.env` | the shell, at script run time |
+| `QUEUE_URL`, `API_TOKEN` | `~/.config/always-on-agent-ops/secrets.env` (or `$AOA_SECRETS_FILE`) | parsed by the preflight at run time — never sourced |
+| `PURGE_DRY_RUN`, `LOG_RETENTION_DAYS`, `LOCK_TTL_MIN` | environment (optional) | the shell; default dry run, `30`, `15` |
 | `OPENCLAW_HOME`, `OPENCLAW_AGENT_ID` | environment (optional) | the shell; default `~/.openclaw` and `main` |
 | `GATEWAY_TOKEN`, `MODEL_PRIMARY`, `MODEL_FALLBACK`, `RUNTIME_ID`, `PROVIDER`, `*_PLUGIN`, `CHANNEL`, `NOTIFY_CHANNEL` | `openclaw.json` / job definitions below | **you, by hand** — OpenClaw does not interpolate `${...}` in its config. A literal `${GATEWAY_TOKEN}` left in the file is a literal token, and strict validation will not save you from it. |
 | *(third-party, beyond `metadata.requires`)* | an authenticated queue endpoint you own or may call, a model provider account, a notification channel | you, before the first run |
@@ -62,11 +70,12 @@ chmod 600 scripts/secrets.env      # never commit it; it is not shipped with thi
 | Service needs a logged-in session | A dedicated machine, auto-login, session never locked out. No headless server. Because the session is always unlocked, that machine must be physically secured, full-disk-encrypted, and carry no data unrelated to the agent — auto-login is only acceptable on a host with nothing else to lose. |
 | Sleep kills the session | Disable disk/display sleep on AC power. |
 | Restart is not automatic | A daily `gateway restart` cron (`cr-20`, 06:00) re-arms the loop. |
-| A dead job stays dead | A watchdog cron 5 min later (`cr-21`, 06:05) lists jobs and reruns errored/stuck ones. |
+| A dead job stays dead | A watchdog cron 5 min later (`cr-21`, 06:05) lists jobs and **reports** errored/stuck ones. It reruns nothing on its own — see the gate in §Cron layer. |
 | File-lock races | Keep `~/.openclaw` out of any syncing folder (iCloud/Dropbox). |
 | Stray env overrides | A `launchctl setenv` gateway token silently overrides config → permanent "unauthorized". Unset it. |
 | Node version drift | `nvm install 22 && nvm alias default 22` — check the CURRENT minimum (has been ≥22.x); a version manager keeps it identical across redeploys, the OS package does not. |
-| `sharp` fails to install | It compiles against a system libvips. `SHARP_IGNORE_GLOBAL_LIBVIPS=1 npm install -g openclaw@latest`, then `openclaw --version` → `2026.6.x` (verify the live release; never hardcode it in a runbook). |
+| Unpinned global install | `@latest` on a 24/7 host means the next reinstall silently changes the gateway under your crons. **Pin the exact release you tested**: `npm install -g openclaw@<version>` (this skill was last verified on `2026.8.1`), then `openclaw --version`. Upgrade deliberately, then run the §Ops checklist update row. |
+| `sharp` fails to install | It compiles against a system libvips. Prefix the pinned install: `SHARP_IGNORE_GLOBAL_LIBVIPS=1 npm install -g openclaw@<version>`. |
 | macOS ships **bash 3.2** | `mapfile`/`readarray` are bash 4+. The shipped scripts avoid them; keep anything you add 3.2-compatible. |
 
 ## The loopback cascade — `bind: "loopback"` (§Config) answers only on `127.0.0.1`
@@ -178,8 +187,10 @@ The four housekeeping jobs the §Ops checklist watches — `argv[0]` is an **abs
 | id | Schedule | Payload |
 |---|---|---|
 | `cr-20-restart` | `{ kind: "cron", expr: "0 6 * * *", tz: "UTC" }` | `{ kind: "command", argv: ["/opt/homebrew/bin/openclaw", "gateway", "restart"] }` |
-| `cr-21-watchdog` | `{ kind: "cron", expr: "5 6 * * *", tz: "UTC" }` | `{ kind: "agentTurn", tools: ["exec"], message: "Run openclaw cron list. Rerun errored/stuck jobs. Report one status line." }` |
-| `cr-22-purge` | `{ kind: "cron", expr: "0 5 * * 0", tz: "UTC" }` | `{ kind: "command", argv: ["/abs/path/to/scripts/purge-retention.sh"] }` |
+| `cr-21-watchdog` | `{ kind: "cron", expr: "5 6 * * *", tz: "UTC" }` | `{ kind: "agentTurn", tools: ["exec"], message: "Run exactly: openclaw cron list. Report errored or stuck job ids in one status line with status Human action required. Do not run, edit, enable, disable or delete any job. Run no other command." }` |
+| `cr-22-purge` | `{ kind: "cron", expr: "0 5 * * 0", tz: "UTC" }` | `{ kind: "command", argv: ["/abs/path/to/scripts/purge-retention.sh"] }` — dry run. Armed, after you read one dry-run list: `argv: ["/usr/bin/env", "PURGE_DRY_RUN=0", "/abs/path/to/scripts/purge-retention.sh"]` |
+
+**The watchdog is report-only by design.** An unattended turn holding `exec` that may rerun "whatever looks stuck" can re-fire a job that pushes, sends or bills — twice. Reruns stay a human decision: read the `cr-21` line, then `openclaw cron run <id>` yourself. If you must automate it, widen deliberately and narrowly: name the rerunnable ids in the message (a closed list of idempotent, read-only jobs), cap it at one rerun per job per day, and never include a job that acts outside the host.
 | `cr-23-oauth` | `{ kind: "cron", expr: "0 8 * * *", tz: "UTC" }` | `{ kind: "agentTurn", tools: ["exec"], message: "Run scripts/oauth-expiry-check.sh. If status is warn or missing, alert that a human relogin is needed. Silent on ok." }` |
 
 - **Idempotence first.** A cron wakes with no memory. Before acting, read the state: your own index file *and* the remote's. In doubt, SKIP — a skipped run costs nothing, a duplicate action costs trust.
@@ -236,7 +247,7 @@ Verify rather than trust the shape: `openclaw cron list`, read the next-run time
 # counts; an API renaming `items` to `results` degrades to a count, not a crash loop). "Counted zero"
 # is NOT "found nothing to count": an empty array is 0, but no-count-and-no-array — a 200 carrying
 # {"error":"unauthorized"}, 502 HTML, a captive portal — is an Error. A green "Nothing to do" while the
-# queue fills is worse than a crash. No secrets.env, dead host, junk body -> one status line, exit 0,
+# queue fills is worse than a crash. No config, open perms, http://, dead host, junk body -> one line, exit 0,
 # never a bare shell error. Hence no `set -e`: a broken preflight must still produce a line.
 # Output: pf-10-queue - Nothing to do / Result: Queue empty. / ... / Details: count=0
 # Output: pf-10-queue - Error / Result: Payload carries no count and no array... / Details: reason=no_countable_field
@@ -244,7 +255,7 @@ Verify rather than trust the shape: `openclaw cron list`, read the next-run time
 
 `scripts/event-dispatch.sh` maps events → jobs, with three guards:
 
-1. **`mkdir` lock** per job id — atomic, no race, released on `RETURN`, `EXIT`, `INT` and `TERM`, plus a TTL. `trap ... RETURN` alone is not enough: a `kill -9`, the 06:00 restart or a sleeping machine leaves the dir behind and blocks that event **forever**, while the channel keeps printing a healthy-looking `Blocked`. A lock older than `LOCK_TTL_MIN` (default 15) is reclaimed.
+1. **`mkdir` lock** per job id — atomic, no race, released with `rmdir` (never a recursive delete) on `RETURN`, `EXIT`, `INT` and `TERM`, plus a TTL. `trap ... RETURN` alone is not enough: a `kill -9`, the 06:00 restart or a sleeping machine leaves the dir behind and blocks that event **forever**, while the channel keeps printing a healthy-looking `Blocked`. A lock older than `LOCK_TTL_MIN` (default 15) is reclaimed.
 2. **Job exists** — `openclaw cron get <id>` first. A non-zero exit, an empty answer, or a reply that is not JSON carrying that id is an `Error` line naming the fix. It classifies into exactly `unknown | running | idle`, so a release whose `cron get` exits 0 and prints prose ("job not found") cannot fall through to a run on a bogus id. Verify yours: `openclaw cron get nope; echo $?`.
 3. **`runningAtMs` guard** — if the job is mid-run, report `Blocked` and return 0. Never stack turns on a running job.
 
@@ -255,13 +266,14 @@ One event may fan out to several jobs (`source_changed` → reviewer + drift-wat
 | Symptom | Root cause | Fix |
 |---|---|---|
 | Event dispatch reports success, job never runs | **`openclaw cron add` accepts no `--id`: the installed job gets an auto-generated UUID**, and its name is prefixed. Your template's tidy `cr-30-reviewer` exists only in your file. The dispatcher's `openclaw cron run cr-30-reviewer` targets a job that was never installed — and it fails in a way that reads like nothing happened. Every job created via CLI is affected; only hand-seeded `jobs.json` entries keep their ids. | `openclaw cron list`, copy the **real** ids, and point the mapping at those. Re-check after any re-provisioning: new install, new UUIDs. |
-| Script dies with no status line, exit 126 | The exec bit did not survive install — ClawHub ships text, not modes | `chmod +x scripts/*.sh` (§Setup). `cron-message.sh` stays 644 |
+| Script dies with no status line, exit 126 | The exec bit did not survive install — ClawHub ships text, not modes | The four `chmod +x` in §Setup. `cron-message.sh` stays 644 |
+| Preflight says `reason=config_mode` / `url_not_https` | Config file readable by others, or a plain-http queue URL | `chmod 600` the file; use `https://`. The Bearer is never sent until both hold |
 | Feature configured but absent, no error | `plugins` allowlist is exclusive — the entry is missing | Add it to `plugins.entries` and **restart** |
 | `Model not allowed` before any answer | Model used but not in `agents.defaults.models` | Add it with its `agentRuntime` |
 | Gateway won't boot after an edit | Strict validation rejected an unknown key | `openclaw doctor --fix`, read the stripped-key list and the `.bak` |
 | Config edited, behaviour unchanged | Last-known-good restored, or `gateway.*`/`plugins.*` needs a restart | `openclaw gateway restart`, then verify live state |
 | Persistent "unauthorized" on loopback | A `launchctl setenv` token overrides the config file | Unset it, restart |
-| Dispatch always says `Blocked`, no job ever runs | A killed run (restart, sleep, `kill -9`) orphaned its lock dir; the channel looks healthy | `rm -rf "${TMPDIR:-/tmp}"/openclaw-event-*.lock`. The TTL reclaims it after `LOCK_TTL_MIN`; lower it if your jobs are short |
+| Dispatch always says `Blocked`, no job ever runs | A killed run (restart, sleep, `kill -9`) orphaned its lock dir; the channel looks healthy | Wait: the TTL reclaims it after `LOCK_TTL_MIN` (lower it if your jobs are short). Now: `rmdir` the **exact** path printed in the `Blocked` line's `Next action` — one dir, no glob, no `-r`. `rmdir` refuses anything non-empty; if it refuses, something else wrote there — look before you delete |
 | `cr-23` says `ok` while every turn fails | Several profiles in one auth file, and a fresh one masked the dead one — the shipped checker takes the **earliest** expiry precisely for this | Read `field` in the JSON: it names the profile that decided. If you wrote your own checker, take the min — and make "cannot determine" a `warn`, never an `ok` |
 | `cr-22` reports `Not an OpenClaw home` | `OPENCLAW_HOME` points somewhere without `openclaw.json` or `agents/` — a typo or a stale env var | Intended: the purge refuses any dir it cannot prove is an agent home rather than deleting on faith. Fix the variable |
 | All runs fail overnight, no alert | OAuth expired headless | `cr-23` + human relogin; consider an API key |
@@ -272,17 +284,17 @@ One event may fan out to several jobs (`source_changed` → reviewer + drift-wat
 | Watch | Cadence | Symptom → cause |
 |---|---|---|
 | `openclaw gateway status` | daily (`cr-20` restart 06:00) | not up → session logged out / machine slept |
-| `openclaw cron list` | daily (`cr-21` watchdog 06:05) | errored/stuck jobs → rerun; missing next-run → scheduler restart |
+| `openclaw cron list` | daily (`cr-21` watchdog 06:05) | errored/stuck ids reported → a human decides each rerun; missing next-run → scheduler restart |
 | `oauth-expiry-check.sh` | daily (`cr-23` 08:00) | `warn`/`missing` → human relogin, today |
 | Preflight + `dispatch` status lines | continuous | `reason=no_countable_field` → the endpoint changed shape or the token died (it self-reports; it does not print a green `Nothing to do`); `dispatch - Error` → mapping points at dead ids |
 | Heavy-job fallback runs | weekly | fallback firing every time → the preflight is broken, fix the preflight |
-| Logs + workspace size | weekly (`cr-22` purge 05:00 Sun) | logs past 30d → purged automatically; workspace growing → set your own bound |
+| Logs + workspace size | weekly (`cr-22` purge 05:00 Sun) | `mode=dry_run` line → not armed yet: read the list, then arm (§Cron layer); armed → logs past 30d purged; workspace growing → set your own bound |
 | `openclaw --version` + Node | on update | after `openclaw update`: `doctor`, `gateway restart`, `health` |
 
 ## Scope
 
-This skill ONLY: configures an OpenClaw host you control; polls endpoints **you** own or are authorized to call; schedules jobs with per-job tool restrictions; monitors auth expiry and alerts a human; deletes only its own logs past the stated window; emits normalized status lines.
+This skill ONLY: configures an OpenClaw host you control; polls endpoints **you** own or are authorized to call, over HTTPS; creates cron jobs you review, with per-job tool restrictions; reads auth-profile expiry metadata and alerts a human; deletes only `*.log` files under `$OPENCLAW_HOME/logs` past the stated window, once you arm it; emits normalized status lines.
 
-This skill NEVER: exposes the control plane beyond loopback; bypasses an anti-abuse control, rate limit, or authentication check — when a defence triggers, the run **stops and pings a human** instead of adapting; performs an irreversible action unattended; conceals a failure behind an ack; writes secrets into the workspace, the notification channel, or git.
+This skill NEVER: exposes the control plane beyond loopback; bypasses an anti-abuse control, rate limit, or authentication check — when a defence triggers, the run **stops and pings a human** instead of adapting; performs an irreversible action unattended; reruns a job without a human decision; prints a token value; conceals a failure behind an ack; writes secrets into the workspace, the notification channel, or git.
 
 *Alexandre Bloch — Bloch Agents · ClawHub @AlexBloch-IA*
